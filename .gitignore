@@ -1,0 +1,25 @@
+# ---- colcon / ROS2 build artifacts ----
+build/
+install/
+log/
+
+# ---- vendored third-party (obtained separately; has its own git repo) ----
+src/zed-ros2-wrapper/
+
+# ---- large model weights ----
+# ffc_rs_26.onnx (used by object_detection.py) is tracked intentionally.
+test_scripts/best.onnx
+
+# ---- python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ---- editor / OS ----
+.vscode/
+.idea/
+*.swp
+.DS_Store
