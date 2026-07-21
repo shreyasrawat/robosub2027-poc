@@ -1,0 +1,134 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Command1
+        - /Goal1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Name: root
+  Global Options:
+    Background Color: 25; 25; 30
+    Fixed Frame: odom
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 0.5
+      Plane Cell Count: 20
+      Color: 70; 70; 80
+      Line Style:
+        Line Width: 0.01
+        Value: Lines
+    - Class: rviz_default_plugins/TF
+      Name: TF
+      Enabled: true
+      Marker Scale: 0.4
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+    - Class: rviz_default_plugins/Odometry
+      Name: Odometry
+      Enabled: true
+      Topic:
+        Value: /rov/odom
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      Covariance:
+        Value: false
+      # One arrow per 3 cm of travel, ~150 kept: a readable breadcrumb trail
+      # rather than a solid wall of arrows. Raise Keep for a longer history.
+      Keep: 150
+      Position Tolerance: 0.03
+      Angle Tolerance: 0.1
+      Shape:
+        Value: Arrow
+        Color: 0; 230; 255
+        Alpha: 0.6
+        Shaft Length: 0.15
+        Shaft Radius: 0.02
+        Head Length: 0.06
+        Head Radius: 0.04
+    # From the rviz_imu_plugin package (shipped with the ZED ROS2 wrapper's
+    # dependencies); rviz_default_plugins has no Imu display.
+    - Class: rviz_imu_plugin/Imu
+      Name: IMU
+      Enabled: true
+      Topic:
+        Value: /rov/imu
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+      # Property names below are the plugin's own (rviz_imu_plugin), not the
+      # rviz_default_plugins spelling; a mismatched key is silently ignored
+      # and the display falls back to its default.
+      Box properties:
+        Enable box: false
+      Axes properties:
+        Enable axes: true
+        Axes scale: 0.3
+      Acceleration properties:
+        # 1 g is ~9.8 m/s^2 and the ZED reports acceleration including
+        # gravity, so at the default scale it draws a column that swamps the
+        # scene. At 0.01 gravity is a 10 cm stub and a thruster kick or an
+        # impact is the part that stands out.
+        Enable acceleration: true
+        Derotate acceleration: true
+        Acc. vector alpha: 0.8
+        Acc. vector color: 255; 80; 80
+        Acc. vector scale: 0.01
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Heading
+      Enabled: true
+      Topic:
+        Value: /rov/heading
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Command
+      Enabled: true
+      Topic:
+        Value: /rov/command
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+    - Class: rviz_default_plugins/MarkerArray
+      Name: Goal
+      Enabled: true
+      Topic:
+        Value: /rov/goal
+        Depth: 1
+        Reliability Policy: Reliable
+        Durability Policy: Volatile
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Name: Orbit
+      Distance: 4.5
+      Pitch: 0.6
+      Yaw: 2.4
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Target Frame: base_link
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 900
+  Width: 1400

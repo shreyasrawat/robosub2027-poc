@@ -6,6 +6,7 @@ ROS2 (colcon) workspace for the RoboSub 2027 autonomous underwater vehicle.
 
 | Path | What |
 |------|------|
+| `rov/` | First-party. Autonomous control framework: MAVLink link, ZED localization, closed-loop motion, missions. See `rov/README.md`. |
 | `src/zed-ros2-wrapper/` | Vendored Stereolabs ZED ROS2 wrapper (C++). Third-party; own git repo. |
 | `test_scripts/` | First-party code. Standalone Python (no ROS runtime). |
 | `test_scripts/runtime_info.py` | Inference-backend selection + startup GPU diagnostics. |
@@ -13,7 +14,50 @@ ROS2 (colcon) workspace for the RoboSub 2027 autonomous underwater vehicle.
 | `plans/` | Plan / design documents for future work. |
 | `build/` `install/` `log/` | colcon artifacts. Do not edit. |
 
-Only `test_scripts/` and `plans/` and this file are first-party. Everything under `src/` is vendored.
+Only `rov/`, `test_scripts/`, `plans/` and this file are first-party. Everything under `src/` is vendored.
+
+## `rov/` — control framework
+
+Layered API for autonomous operation. Mission code imports `rov` and never
+touches PyMAVLink or the ZED SDK; the Pixhawk keeps all stabilization, motor
+mixing and failsafes, and the package only sends `MANUAL_CONTROL` demands.
+
+```
+rov/api/config.py       every tunable (PID gains, tolerances, limits, timeouts)
+rov/api/controllers.py  PID math (anti-windup, derivative-on-measurement)
+rov/api/vehicle.py      the only pymavlink importer: link, arm, modes, MANUAL_CONTROL
+rov/api/zed_pose.py     the only ZED SDK importer: fused VIO pose, velocity, tracking health
+rov/api/telemetry.py    depth, attitude, battery, heartbeat (subscribes to vehicle)
+rov/api/movement.py     closed-loop primitives: move_*, turn, goto, hold_*
+rov/api/mission.py      behaviours: submerge, find_gate, drive_through, surface
+rov/vision/             detections -> normalized control targets
+rov/ros/                optional RViz bridge (publish-only), + rov.rviz config
+rov/rov.py              the ROV facade
+rov/main.py             CLI entry point
+rov/tests/console.py    interactive movement REPL (safety-gated `sub` object)
+```
+
+```bash
+python3 -m rov.main --status                    # telemetry only, never arms
+python3 -m rov.main --mission square --side 0.5
+python3 -m rov.main --status --rviz             # + publish to ROS2; then: rviz2 -d rov/ros/rov.rviz
+python3 -m rov.tests.test_api                   # offline math checks, no hardware
+python3 -m rov.tests.console                    # live REPL: sub.move_forward(0.5), sub.turn(90)
+```
+
+RViz shows pose/TF, IMU, heading, the live MANUAL_CONTROL demand and the
+active goal on `/rov/*`. Cyan = measured, orange = commanded, green = goal.
+The bridge never commands motion and `rclpy` is imported lazily, so the stack
+still runs with no ROS installed.
+
+Full design rationale in `rov/README.md`. Two properties to preserve when
+editing: **every primitive is closed-loop** (no fixed-duration or sleep-based
+motion anywhere), and **one MAVLink reader / one camera grabber** — pymavlink
+connections are unsafe to read concurrently and the ZED SDK allows a single
+handle per device per process.
+
+Adds `pymavlink` to the dependency set below. Gains are untuned starting
+values and the mount offsets are placeholder zeros.
 
 ## `test_scripts/object_detection.py`
 
