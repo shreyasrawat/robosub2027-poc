@@ -23,18 +23,36 @@ Coordinate frames
 
 The active navigation target class can be switched at runtime (number keys / n-p,
 or `set_target_class()` from mission code) so one script serves a whole mission.
+
+Execution
+---------
+Inference runs on the Jetson GPU via TensorRT or CUDA; provider selection,
+startup diagnostics and the no-silent-CPU-fallback policy live in
+``runtime_info.py``. The ONNX session is built lazily (see :func:`get_session`)
+so importing this module for its geometry helpers costs nothing.
+
+By default the loop is split into three stages — capture, inference, render —
+running in separate threads with drop-oldest handoff, so a slow stage cannot
+stall the others. Set ``PIPELINE_THREADS = False`` (or ``SERIAL=1`` in the
+environment) for the original single-threaded loop; both paths call the same
+stage functions.
 """
+
+import os
+import threading
+import time
+from collections import deque
 
 import cv2
 import numpy as np
-import onnxruntime as ort
-import pyzed.sl as sl
+
+import runtime_info
 
 # ------------------------
 # Configuration
 # ------------------------
 
-MODEL_PATH = "/home/robosub/robosub2027/robosub-2027-ws/test_scripts/ffc_rs_26.onnx"
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffc_rs_26.onnx")
 
 INPUT_WIDTH = 416
 INPUT_HEIGHT = 416
@@ -65,23 +83,107 @@ COLOR_BOX = (0, 255, 0)      # BGR: normal detections
 COLOR_TARGET = (255, 255, 0) # BGR: active target box (cyan)
 COLOR_PATH = (0, 165, 255)   # BGR: nav path / arrow (orange)
 
+# --- Runtime / performance ---
+# Three-stage threaded pipeline (capture | inference | render). Off => original
+# serial loop, useful when debugging frame-exact behaviour.
+PIPELINE_THREADS = os.environ.get("SERIAL", "0") != "1"
+# ZED depth mode name. NEURAL is the most accurate and the most expensive; on a
+# loaded Orin Nano NEURAL_LIGHT frees ~40% of the depth GPU/VRAM cost. Default
+# unchanged.
+DEPTH_MODE = os.environ.get("ZED_DEPTH_MODE", "NEURAL")
+# Print a rolling FPS / stage-latency line every N frames (0 disables).
+PERF_LOG_EVERY = int(os.environ.get("PERF_LOG_EVERY", "60"))
+
 
 # ------------------------
-# ONNX session
+# ONNX session (lazy, built once)
 # ------------------------
 
-providers = [
-    "CUDAExecutionProvider",
-    "CPUExecutionProvider",
-]
+_session = None
+_input_name = None
+_session_lock = threading.Lock()
 
-session = ort.InferenceSession(MODEL_PATH, providers=providers)
-input_name = session.get_inputs()[0].name
+
+def get_session():
+    """Return the process-wide ``InferenceSession``, creating it on first use.
+
+    Lazy so that importing this module for :func:`mount_matrix`, :func:`project`
+    etc. (as ``test_geometry.py`` does) neither loads the model nor touches the
+    GPU. Thread-safe: the pipeline's inference thread and any caller share one
+    session rather than each building their own.
+    """
+    global _session, _input_name
+    if _session is None:
+        with _session_lock:
+            if _session is None:
+                sess, _info = runtime_info.create_session(MODEL_PATH)
+                # publish only once fully built + warmed, so a concurrent reader
+                # never sees a session that still has to pay first-call cost
+                _input_name, _session = sess.get_inputs()[0].name, sess
+    return _session, _input_name
+
+
+def close_session():
+    """Release the inference session and its GPU buffers.
+
+    Only the native TensorRT backend holds resources worth releasing explicitly
+    (device allocations, pinned host memory, a CUDA stream); ORT sessions are
+    reclaimed on collection. Safe to call when no session was ever built.
+    """
+    global _session, _input_name
+    with _session_lock:
+        if _session is not None and hasattr(_session, "close"):
+            _session.close()
+        _session, _input_name = None, None
 
 
 # ------------------------
 # Preprocess / detect
 # ------------------------
+
+class Preprocessor:
+    """Reusable BGRA-frame -> model-tensor converter with preallocated buffers.
+
+    The naive version allocated five full images per frame and did the expensive
+    colour conversion at full resolution:
+
+        BGRA(720p) -> BGR(720p) -> resize(416) -> RGB(416) -> float32 -> CHW -> batch
+
+    This version resizes *first* (so every later op touches 416x416 instead of
+    1280x720), folds the alpha-drop and channel-swap into one ``cvtColor``, and
+    writes into buffers owned by the instance, so a steady-state frame performs
+    zero heap allocation and the tensor handed to ORT keeps a stable address.
+    """
+
+    def __init__(self, width=INPUT_WIDTH, height=INPUT_HEIGHT):
+        self.width, self.height = width, height
+        self._small = np.empty((height, width, 4), np.uint8)    # resized BGRA
+        self._rgb = np.empty((height, width, 3), np.uint8)      # RGB
+        self._tensor = np.empty((1, 3, height, width), np.float32)
+        self._chw = self._tensor[0]                             # view, not a copy
+
+    def __call__(self, frame):
+        """Convert an HxWx4 BGRA frame to a [1,3,H,W] float32 RGB 0..1 tensor.
+
+        The returned array is owned and reused by this instance; the caller must
+        finish with it before the next call (true for both pipeline paths, where
+        one preprocessor belongs to one inference stage).
+        """
+        # Resize on the 4-channel image: one pass over the big frame, not two.
+        cv2.resize(frame, (self.width, self.height), dst=self._small,
+                   interpolation=cv2.INTER_LINEAR)
+        # Drop alpha and swap BGR->RGB in a single conversion.
+        cv2.cvtColor(self._small, cv2.COLOR_BGRA2RGB, dst=self._rgb)
+        # uint8 -> float32 0..1 straight into the CHW buffer, one channel at a
+        # time: avoids materialising an HWC float image and a transposed copy.
+        np.multiply(self._rgb.transpose(2, 0, 1), np.float32(1.0 / 255.0),
+                    out=self._chw, casting="unsafe")
+        return self._tensor
+
+
+# Module-level preprocessor for the serial path / direct callers.
+_preprocess = Preprocessor()
+
 
 def preprocess(frame):
     """Convert a ZED BGRA frame into the model's input tensor.
@@ -91,15 +193,9 @@ def preprocess(frame):
 
     Returns:
         float32 tensor of shape [1, 3, INPUT_HEIGHT, INPUT_WIDTH], RGB, 0..1,
-        channels-first with a batch dimension.
+        channels-first with a batch dimension. Buffer is reused between calls.
     """
-    img = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)          # drop alpha
-    resized = cv2.resize(img, (INPUT_WIDTH, INPUT_HEIGHT))
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)         # model trained on RGB
-    tensor = rgb.astype(np.float32) / 255.0                # normalise 0..1
-    tensor = np.transpose(tensor, (2, 0, 1))               # HWC -> CHW
-    tensor = np.expand_dims(tensor, axis=0)                # add batch dim
-    return tensor
+    return _preprocess(frame)
 
 
 def postprocess(output, frame):
@@ -112,6 +208,11 @@ def postprocess(output, frame):
         6-37 : 32 mask coefficients (unused for detection)
     Rows are padded to 300; unused rows have confidence 0.
 
+    Vectorised: the confidence threshold is applied as a mask over all 300 rows
+    at once and only the surviving rows (typically 0-5) are scaled and converted
+    to Python objects. The old per-row Python loop paid interpreter cost for the
+    ~295 zero-padding rows on every frame.
+
     Args:
         output: raw output0 array (any leading batch dims are squeezed).
         frame:  full-resolution frame, used to scale boxes from 416 space to pixels.
@@ -120,37 +221,47 @@ def postprocess(output, frame):
         list of dicts, each ``{'class_id': int, 'conf': float,
         'box': (x1, y1, x2, y2), 'center': (u, v)}`` in FULL-RES pixel coords.
     """
-    detections = np.squeeze(output)
+    dets = np.squeeze(output)
+    if dets.ndim != 2 or dets.shape[0] == 0:
+        return []
+
+    keep = dets[:, 4] >= CONFIDENCE_THRESHOLD   # also drops the zero padding
+    if not keep.any():
+        return []
+    rows = dets[keep]
 
     h, w = frame.shape[:2]
-    x_factor = w / INPUT_WIDTH
-    y_factor = h / INPUT_HEIGHT
+    scale = np.array([w / INPUT_WIDTH, h / INPUT_HEIGHT,
+                      w / INPUT_WIDTH, h / INPUT_HEIGHT], np.float32)
+    boxes = (rows[:, :4] * scale).astype(np.int32)
+    confs = rows[:, 4]
+    classes = rows[:, 5].astype(np.int32)
+    centers = np.stack([(boxes[:, 0] + boxes[:, 2]) // 2,
+                        (boxes[:, 1] + boxes[:, 3]) // 2], axis=1)
 
-    results = []
-    for det in detections:
-        score = float(det[4])
-        if score < CONFIDENCE_THRESHOLD:   # also filters the 300-row zero padding
-            continue
+    return [{'class_id': int(c), 'conf': float(s),
+             'box': (int(b[0]), int(b[1]), int(b[2]), int(b[3])),
+             'center': (int(ct[0]), int(ct[1]))}
+            for b, s, c, ct in zip(boxes, confs, classes, centers)]
 
-        class_id = int(det[5])
 
-        # bbox arrives as xyxy corners in 416 space -> scale to full-res pixels
-        x1 = int(det[0] * x_factor)
-        y1 = int(det[1] * y_factor)
-        x2 = int(det[2] * x_factor)
-        y2 = int(det[3] * y_factor)
+def detect(frame, session=None, input_name=None, pre=None):
+    """Run one full detection: preprocess -> inference -> postprocess.
 
-        u = (x1 + x2) // 2
-        v = (y1 + y2) // 2
+    Args:
+        frame: full-res BGRA frame.
+        session, input_name: override the shared session (used by the pipeline
+            so the inference thread binds them once instead of per frame).
+        pre: a :class:`Preprocessor` to use; defaults to the module-level one.
 
-        results.append({
-            'class_id': class_id,
-            'conf': score,
-            'box': (x1, y1, x2, y2),
-            'center': (u, v),
-        })
-
-    return results
+    Returns:
+        list of detection dicts, see :func:`postprocess`.
+    """
+    if session is None:
+        session, input_name = get_session()
+    tensor = (pre or _preprocess)(frame)
+    outputs = session.run(None, {input_name: tensor})
+    return postprocess(outputs[0], frame)
 
 
 # ------------------------
@@ -165,14 +276,18 @@ def get_3d_point(point_cloud, u, v):
     with unknown depth as NaN/inf, so those are dropped first.
 
     Args:
-        point_cloud: ``sl.Mat`` retrieved with ``MEASURE.XYZRGBA`` (CPU memory).
+        point_cloud: ``sl.Mat`` retrieved with ``MEASURE.XYZRGBA`` (CPU memory),
+            or the HxWx4 numpy array itself (the pipeline resolves ``get_data()``
+            once per frame instead of once per lookup).
         u, v: pixel coordinates in FULL-RES image space.
 
     Returns:
         np.array([X, Y, Z]) in the LEFT optical frame, or ``None`` if no valid
         depth is available in the window.
     """
-    data = point_cloud.get_data()          # HxWx4 float32: X, Y, Z, packed color
+    if point_cloud is None:
+        return None
+    data = point_cloud if isinstance(point_cloud, np.ndarray) else point_cloud.get_data()
     h, w = data.shape[:2]
 
     r = DEPTH_PATCH // 2
@@ -248,6 +363,31 @@ def project(p_cam, fx, fy, cx, cy):
     return u, v
 
 
+def project_many(points_veh, fx, fy, cx, cy, R, t):
+    """Project a batch of vehicle-frame points to pixels in one vectorised pass.
+
+    Equivalent to ``project(to_camera(p, R, t), ...)`` per point, but computed as
+    two small matrix ops instead of a Python loop with per-point allocations.
+
+    Args:
+        points_veh: (N, 3) array of vehicle-frame points.
+        fx, fy, cx, cy: intrinsics. R, t: mount transform.
+
+    Returns:
+        (M, 2) int32 pixel array containing only the points in front of the lens.
+    """
+    p = np.asarray(points_veh, dtype=np.float64)
+    cam = (p - t) @ R                       # == (R.T @ (p - t).T).T
+    z_opt = cam[:, 0]
+    front = z_opt > 1e-6
+    if not front.any():
+        return np.empty((0, 2), np.int32)
+    cam, z_opt = cam[front], z_opt[front]
+    u = fx * (-cam[:, 1]) / z_opt + cx
+    v = fy * (-cam[:, 2]) / z_opt + cy
+    return np.stack([u, v], axis=1).astype(np.int32)
+
+
 # ------------------------
 # Tracking
 # ------------------------
@@ -285,7 +425,8 @@ class Track:
 
         Args:
             detections: list from :func:`postprocess`.
-            point_cloud: ``sl.Mat`` XYZ cloud for this frame.
+            point_cloud: ``sl.Mat`` (or ndarray) XYZ cloud for this frame; ``None``
+                is treated as "no depth this frame" and coasts.
             R, t: mount transform from :func:`mount_matrix`.
 
         Returns:
@@ -339,9 +480,24 @@ class Track:
         return "SEARCHING"
 
 
+def wants_depth(detections):
+    """True if this frame contains a detection of the active target class.
+
+    Only then does the tracker need the point cloud, so the serial path can skip
+    the ~15 MB device->host copy of ``retrieve_measure`` entirely on frames where
+    nothing is locked.
+    """
+    return any(d['class_id'] == ACTIVE_TARGET_CLASS for d in detections)
+
+
 # ------------------------
 # Path generation
 # ------------------------
+
+# Sample fractions along the vehicle->target line. Constant, so it is built once
+# instead of calling linspace on every frame.
+_PATH_TS = np.linspace(0.0, 1.0, PATH_SAMPLES).reshape(-1, 1)
+
 
 def compute_path(target_veh):
     """Straight-line route from the vehicle origin to the target.
@@ -355,16 +511,17 @@ def compute_path(target_veh):
 
     Returns:
         dict with ``distance`` (m), ``yaw`` (rad, +left), ``pitch`` (rad, +up),
-        and ``points`` (list of PATH_SAMPLES 3D vehicle-frame points from origin
-        to target, for on-image drawing).
+        and ``points`` (a (PATH_SAMPLES, 3) array of vehicle-frame points from the
+        origin to the target, for on-image drawing).
     """
-    x, y, z = target_veh
-    distance = float(np.linalg.norm(target_veh))
+    target = np.asarray(target_veh, dtype=np.float64)
+    x, y, z = target
+    distance = float(np.linalg.norm(target))
     yaw = float(np.arctan2(y, x))                    # heading in the horizontal plane
     pitch = float(np.arctan2(z, np.hypot(x, y)))     # elevation above horizontal
 
-    ts = np.linspace(0.0, 1.0, PATH_SAMPLES)
-    points = [np.array(target_veh, dtype=np.float64) * s for s in ts]
+    # (PATH_SAMPLES, 3) in one broadcast instead of a list comprehension of arrays
+    points = _PATH_TS * target
 
     return {'distance': distance, 'yaw': yaw, 'pitch': pitch, 'points': points}
 
@@ -397,15 +554,10 @@ def render(frame, detections, track, path, intr):
 
     # --- nav path + arrow (only when locked) ---
     if path is not None and track.box is not None:
-        # project each sampled 3D path point back to the image and draw a polyline
-        pix = []
-        for p_veh in path['points']:
-            p_cam = to_camera(p_veh, R, t)
-            uv = project(p_cam, fx, fy, cx, cy)
-            if uv is not None:
-                pix.append(uv)
+        # project every sampled 3D path point back to the image in one pass
+        pix = project_many(path['points'], fx, fy, cx, cy, R, t)
         if len(pix) >= 2:
-            cv2.polylines(frame, [np.array(pix, dtype=np.int32)], False, COLOR_PATH, 2)
+            cv2.polylines(frame, [pix], False, COLOR_PATH, 2)
 
         # arrow from a fixed vehicle-reference anchor (bottom-center) to the target
         h, w = frame.shape[:2]
@@ -427,66 +579,320 @@ def render(frame, detections, track, path, intr):
 
 
 # ------------------------
+# Perf accounting
+# ------------------------
+
+class StageTimer:
+    """Rolling per-stage latency + FPS, printed every ``PERF_LOG_EVERY`` frames.
+
+    Cheap enough to leave on: one ``perf_counter`` pair per stage and a bounded
+    deque, no allocation growth.
+    """
+
+    def __init__(self, window=60):
+        self.times = {}
+        self.window = window
+        self._frames = 0
+        self._last = time.perf_counter()
+        self._fps = 0.0
+
+    def record(self, stage, seconds):
+        buf = self.times.get(stage)
+        if buf is None:
+            buf = self.times[stage] = deque(maxlen=self.window)
+        buf.append(seconds)
+
+    def tick(self):
+        """Count a completed output frame; returns a report string or None."""
+        self._frames += 1
+        if PERF_LOG_EVERY and self._frames % PERF_LOG_EVERY == 0:
+            now = time.perf_counter()
+            self._fps = PERF_LOG_EVERY / (now - self._last)
+            self._last = now
+            parts = " ".join(f"{k} {np.mean(v) * 1000:5.1f}ms"
+                             for k, v in self.times.items())
+            return f"[perf] {self._fps:5.1f} FPS   {parts}"
+        return None
+
+    @property
+    def fps(self):
+        return self._fps
+
+
+# ------------------------
+# Pipeline stages
+# ------------------------
+
+class Frame:
+    """One frame's worth of data flowing between pipeline stages.
+
+    ``image``/``cloud`` are numpy views into ZED-owned ``sl.Mat`` buffers, so the
+    stages must use double buffering (see :class:`CaptureStage`) rather than
+    copying full-resolution images between threads.
+    """
+
+    __slots__ = ("image", "cloud", "detections", "grabbed_at")
+
+    def __init__(self, image, cloud, grabbed_at):
+        self.image = image
+        self.cloud = cloud
+        self.detections = None
+        self.grabbed_at = grabbed_at
+
+
+class CaptureStage:
+    """ZED acquisition, optionally on its own thread.
+
+    Holds two sets of ``sl.Mat`` buffers and alternates between them, so the
+    consumer can still be reading frame N while the camera fills frame N+1
+    without either a copy or a torn read. Nothing is allocated per frame.
+    """
+
+    def __init__(self, zed, sl, timer):
+        self.zed, self.sl, self.timer = zed, sl, timer
+        self.runtime = sl.RuntimeParameters()
+        # two slots, each (image Mat, cloud Mat)
+        self._slots = [(sl.Mat(), sl.Mat()) for _ in range(2)]
+        self._slot = 0
+
+    def grab(self, need_depth=True):
+        """Grab one frame. Returns a :class:`Frame`, or None if the grab failed.
+
+        Args:
+            need_depth: when False the point-cloud retrieval (a ~15 MB
+                device->host copy at HD720) is skipped. The serial path uses this
+                on frames with no active-class detection.
+        """
+        sl = self.sl
+        t0 = time.perf_counter()
+        if self.zed.grab(self.runtime) != sl.ERROR_CODE.SUCCESS:
+            return None
+
+        image_mat, cloud_mat = self._slots[self._slot]
+        self._slot ^= 1
+
+        self.zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+        cloud = None
+        if need_depth:
+            self.zed.retrieve_measure(cloud_mat, sl.MEASURE.XYZRGBA)
+            cloud = cloud_mat.get_data()   # resolved once per frame, not per lookup
+        self.timer.record("capture", time.perf_counter() - t0)
+        return Frame(image_mat.get_data(), cloud, t0)
+
+    def close(self):
+        """Release the ZED buffers and the camera."""
+        for image_mat, cloud_mat in self._slots:
+            image_mat.free()
+            cloud_mat.free()
+        self.zed.close()
+
+
+class InferenceStage:
+    """Model inference with a stage-owned preprocessor and session binding.
+
+    Binding the session and input name once (rather than looking them up per
+    frame) and owning a single :class:`Preprocessor` keeps the hot path free of
+    dict lookups and allocation.
+    """
+
+    def __init__(self, timer):
+        self.session, self.input_name = get_session()
+        self.pre = Preprocessor()
+        self.timer = timer
+
+    def run(self, frame):
+        t0 = time.perf_counter()
+        frame.detections = detect(frame.image, self.session, self.input_name, self.pre)
+        self.timer.record("infer", time.perf_counter() - t0)
+        return frame
+
+
+class LatestSlot:
+    """One-deep, drop-oldest handoff between pipeline threads.
+
+    A queue would let a slow consumer build a backlog of stale frames — the wrong
+    behaviour for live navigation, where only the newest frame matters. Keeping
+    exactly one slot means a slow stage drops frames instead of stalling the
+    stage upstream of it, which is the whole point of splitting the stages.
+    """
+
+    def __init__(self):
+        self._item = None
+        self._cv = threading.Condition()
+        self._closed = False
+
+    def put(self, item):
+        with self._cv:
+            self._item = item
+            self._cv.notify()
+
+    def get(self, timeout=1.0):
+        """Block for the next item; returns None on timeout or after close()."""
+        with self._cv:
+            if self._item is None and not self._closed:
+                self._cv.wait(timeout)
+            item, self._item = self._item, None
+            return item
+
+    def close(self):
+        with self._cv:
+            self._closed = True
+            self._cv.notify_all()
+
+
+# ------------------------
 # Main
 # ------------------------
 
-def main():
-    # --- ZED init: enable depth so we get a 3D point cloud ---
+def _open_zed(sl):
+    """Open the ZED with depth enabled; returns (zed, intrinsics) or (None, None)."""
     zed = sl.Camera()
     init = sl.InitParameters()
     init.camera_resolution = sl.RESOLUTION.HD720
     init.camera_fps = 60
-    init.depth_mode = sl.DEPTH_MODE.NEURAL              # fall back to PERFORMANCE if too slow
+    # NEURAL by default; ZED_DEPTH_MODE=NEURAL_LIGHT trades a little accuracy for
+    # a noticeably smaller GPU + VRAM footprint when running beside RViz/QGC.
+    init.depth_mode = getattr(sl.DEPTH_MODE, DEPTH_MODE, sl.DEPTH_MODE.NEURAL)
     init.coordinate_units = sl.UNIT.METER
     init.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
 
     if zed.open(init) != sl.ERROR_CODE.SUCCESS:
         print("Failed to open ZED")
-        return
+        return None, None
 
     # intrinsics of the LEFT camera, needed to re-project 3D path points to pixels
     calib = zed.get_camera_information().camera_configuration.calibration_parameters
-    fx, fy = calib.left_cam.fx, calib.left_cam.fy
-    cx, cy = calib.left_cam.cx, calib.left_cam.cy
+    left = calib.left_cam
+    return zed, (left.fx, left.fy, left.cx, left.cy)
 
-    R, t = mount_matrix()                              # LEFT-optical -> vehicle
-    intr = (fx, fy, cx, cy, R, t)
 
-    runtime = sl.RuntimeParameters()
-    image = sl.Mat()
-    point_cloud = sl.Mat()
-    track = Track()
+def _handle_key(key):
+    """Apply a keypress. Returns False when the user asked to quit."""
+    if key == ord('q'):
+        return False
+    if ord('0') <= key <= ord('7'):
+        set_target_class(key - ord('0'))
+    elif key == ord('n'):
+        set_target_class((ACTIVE_TARGET_CLASS + 1) % len(CLASS_NAMES))
+    elif key == ord('p'):
+        set_target_class((ACTIVE_TARGET_CLASS - 1) % len(CLASS_NAMES))
+    return True
 
+
+def _run_serial(capture, infer, track, intr, timer):
+    """Original single-threaded loop, kept for frame-exact debugging (SERIAL=1)."""
+    R, t = intr[4], intr[5]
+    need_depth = True
     while True:
-        if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+        frame = capture.grab(need_depth)
+        if frame is None:
             continue
 
-        zed.retrieve_image(image, sl.VIEW.LEFT)
-        zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)   # stereo 3D per pixel
-        frame = image.get_data()
+        infer.run(frame)
+        # Only frames containing the active class need the point cloud; the next
+        # grab skips the copy when this one had nothing to track.
+        need_depth = wants_depth(frame.detections) or track.active
 
-        outputs = session.run(None, {input_name: preprocess(frame)})
-        detections = postprocess(outputs[0], frame)
-
-        target_veh = track.update(detections, point_cloud, R, t)
+        t0 = time.perf_counter()
+        target_veh = track.update(frame.detections, frame.cloud, R, t)
         path = compute_path(target_veh) if target_veh is not None else None
+        render(frame.image, frame.detections, track, path, intr)
+        cv2.imshow("ZED Detection", frame.image)
+        timer.record("render", time.perf_counter() - t0)
 
-        render(frame, detections, track, path, intr)
-        cv2.imshow("ZED Detection", frame)
-
-        # --- keys: q quit, 0-7 select target class, n/p cycle ---
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
+        report = timer.tick()
+        if report:
+            print(report)
+        if not _handle_key(cv2.waitKey(1) & 0xFF):
             break
-        elif ord('0') <= key <= ord('7'):
-            set_target_class(key - ord('0'))
-        elif key == ord('n'):
-            set_target_class((ACTIVE_TARGET_CLASS + 1) % len(CLASS_NAMES))
-        elif key == ord('p'):
-            set_target_class((ACTIVE_TARGET_CLASS - 1) % len(CLASS_NAMES))
 
-    zed.close()
-    cv2.destroyAllWindows()
+
+def _run_threaded(capture, infer, track, intr, timer):
+    """Three-stage pipeline: capture | inference | render.
+
+    Capture and inference each own a thread; rendering stays on the main thread
+    because OpenCV's HighGUI must be driven from it. Stages hand off through
+    drop-oldest :class:`LatestSlot`s, so the display never stalls acquisition and
+    a slow display simply shows fewer, newer frames.
+    """
+    R, t = intr[4], intr[5]
+    to_infer, to_render = LatestSlot(), LatestSlot()
+    stop = threading.Event()
+
+    def capture_loop():
+        while not stop.is_set():
+            frame = capture.grab(need_depth=True)
+            if frame is not None:
+                to_infer.put(frame)
+
+    def infer_loop():
+        while not stop.is_set():
+            frame = to_infer.get()
+            if frame is not None:
+                to_render.put(infer.run(frame))
+
+    threads = [threading.Thread(target=capture_loop, name="capture", daemon=True),
+               threading.Thread(target=infer_loop, name="infer", daemon=True)]
+    for th in threads:
+        th.start()
+
+    try:
+        while True:
+            frame = to_render.get()
+            if frame is None:
+                if not _handle_key(cv2.waitKey(1) & 0xFF):
+                    break
+                continue
+
+            t0 = time.perf_counter()
+            target_veh = track.update(frame.detections, frame.cloud, R, t)
+            path = compute_path(target_veh) if target_veh is not None else None
+            render(frame.image, frame.detections, track, path, intr)
+            cv2.imshow("ZED Detection", frame.image)
+            timer.record("render", time.perf_counter() - t0)
+            timer.record("latency", time.perf_counter() - frame.grabbed_at)
+
+            report = timer.tick()
+            if report:
+                print(report)
+            if not _handle_key(cv2.waitKey(1) & 0xFF):
+                break
+    finally:
+        stop.set()
+        to_infer.close()
+        to_render.close()
+        for th in threads:
+            th.join(timeout=2.0)
+
+
+def main():
+    import pyzed.sl as sl   # imported here so the module stays importable without the SDK
+
+    # Build the ONNX session (and print the execution-provider banner) before
+    # touching the camera, so a GPU misconfiguration fails fast and loudly.
+    get_session()
+
+    zed, cam_intr = _open_zed(sl)
+    if zed is None:
+        return
+
+    R, t = mount_matrix()                              # LEFT-optical -> vehicle
+    intr = (*cam_intr, R, t)
+
+    timer = StageTimer()
+    capture = CaptureStage(zed, sl, timer)
+    infer = InferenceStage(timer)
+    track = Track()
+
+    runner = _run_threaded if PIPELINE_THREADS else _run_serial
+    print(f"[pipeline] mode={'threaded' if PIPELINE_THREADS else 'serial'} "
+          f"depth={DEPTH_MODE}")
+    try:
+        runner(capture, infer, track, intr, timer)
+    finally:
+        capture.close()
+        close_session()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

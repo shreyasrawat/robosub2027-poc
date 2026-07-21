@@ -10,6 +10,10 @@ src/zed-ros2-wrapper/
 # ffc_rs_26.onnx (used by object_detection.py) is tracked intentionally.
 test_scripts/best.onnx
 
+# ---- TensorRT engines (tied to one GPU arch + TRT version; never portable) ----
+test_scripts/.trt_cache/
+*.engine
+
 # ---- python ----
 __pycache__/
 *.py[cod]
