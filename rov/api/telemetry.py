@@ -17,14 +17,14 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from .config import CONFIG, Config
 from .vehicle import Vehicle
 
 logger = logging.getLogger("rov.telemetry")
 
-__all__ = ["Telemetry", "Attitude", "Battery", "IMUSample"]
+__all__ = ["Telemetry", "Attitude", "Battery", "IMUSample", "Velocity"]
 
 
 @dataclass
@@ -70,6 +70,16 @@ class IMUSample:
 
 
 @dataclass
+class Velocity:
+    """Linear velocity in the local frame, m/s (X north/fwd, Y east, Z down)."""
+
+    vx: float = 0.0
+    vy: float = 0.0
+    vz: float = 0.0
+    timestamp: float = 0.0
+
+
+@dataclass
 class _State:
     """Mutable snapshot guarded by :class:`Telemetry`'s lock."""
 
@@ -80,6 +90,14 @@ class _State:
     pressure_hpa: Optional[float] = None
     temperature_c: Optional[float] = None
     heading: Optional[float] = None
+    #: Per-thruster PWM outputs (microseconds), from SERVO_OUTPUT_RAW. ``None``
+    #: until the first message; an empty list means the message reported none.
+    thrusters: Optional[List[int]] = None
+    #: Linear velocity from GLOBAL_POSITION_INT, or ``None`` if not reported.
+    velocity: Optional[Velocity] = None
+    #: True if a leak has been detected via STATUSTEXT. ``None`` = never heard
+    #: from the leak subsystem; ``False`` = reported dry.
+    leak: Optional[bool] = None
     last_message_time: float = 0.0
 
 
@@ -115,6 +133,8 @@ class Telemetry:
             "BATTERY_STATUS": self._on_battery_status,
             "RAW_IMU": self._on_raw_imu,
             "SCALED_IMU2": self._on_scaled_imu,
+            "SERVO_OUTPUT_RAW": self._on_servo_output,
+            "STATUSTEXT": self._on_statustext,
         }
         for msg_type, handler in handlers.items():
             self._vehicle.add_message_handler(msg_type, handler)
@@ -170,7 +190,32 @@ class Telemetry:
         with self._lock:
             # relative_alt is millimetres, positive up.
             self._state.depth = -float(msg.relative_alt) / 1000.0
+            # vx/vy/vz are cm/s in the local NED frame.
+            self._state.velocity = Velocity(
+                vx=msg.vx / 100.0, vy=msg.vy / 100.0, vz=msg.vz / 100.0,
+                timestamp=time.monotonic(),
+            )
             self._touch()
+
+    def _on_servo_output(self, msg) -> None:
+        # servo1_raw..servo8_raw are thruster PWM outputs in microseconds.
+        with self._lock:
+            self._state.thrusters = [
+                int(getattr(msg, f"servo{i}_raw")) for i in range(1, 9)
+            ]
+            self._touch()
+
+    def _on_statustext(self, msg) -> None:
+        # ArduSub announces a wet leak sensor via STATUSTEXT, e.g. "Leak
+        # Detected". There is no positive "dry" message, so leak is set True
+        # on detection and otherwise left at its prior value.
+        text = getattr(msg, "text", "")
+        if isinstance(text, (bytes, bytearray)):
+            text = text.decode("ascii", "replace")
+        if "leak" in text.lower():
+            with self._lock:
+                self._state.leak = "no leak" not in text.lower()
+                self._touch()
 
     def _on_sys_status(self, msg) -> None:
         with self._lock:
@@ -255,6 +300,21 @@ class Telemetry:
                 return None
             return self._state.pressure_hpa, self._state.temperature_c or 0.0
 
+    def get_thrusters(self) -> Optional[List[int]]:
+        """Per-thruster PWM outputs (microseconds), or ``None`` if unseen."""
+        with self._lock:
+            return list(self._state.thrusters) if self._state.thrusters else self._state.thrusters
+
+    def get_velocity(self) -> Optional[Velocity]:
+        """Latest :class:`Velocity` from the autopilot, or ``None``."""
+        with self._lock:
+            return self._state.velocity
+
+    def get_leak(self) -> Optional[bool]:
+        """True if a leak was detected, False if reported dry, ``None`` if unheard."""
+        with self._lock:
+            return self._state.leak
+
     def is_armed(self) -> bool:
         """True if the autopilot's HEARTBEAT reports the vehicle armed."""
         return self._vehicle.armed
@@ -294,6 +354,7 @@ class Telemetry:
         with self._lock:
             state = self._state
             attitude = state.attitude
+            vel = state.velocity
             return {
                 "depth": state.depth,
                 "heading": state.heading,
@@ -301,6 +362,14 @@ class Telemetry:
                 "pitch": attitude.pitch if attitude else None,
                 "yaw": attitude.yaw if attitude else None,
                 "voltage": state.battery.voltage,
+                "current": state.battery.current,
+                "battery_remaining": state.battery.remaining,
+                "temperature": state.temperature_c,
+                "vx": vel.vx if vel else None,
+                "vy": vel.vy if vel else None,
+                "vz": vel.vz if vel else None,
+                "thrusters": list(state.thrusters) if state.thrusters else None,
+                "leak": state.leak,
                 "armed": self._vehicle.armed,
                 "mode": self._vehicle.get_mode(),
                 "heartbeat_age": self._vehicle.last_heartbeat_age,

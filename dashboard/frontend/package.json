@@ -1,0 +1,21 @@
+{
+  "name": "robosub-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "RoboSub 2027 operator dashboard: live ZED feed, telemetry, 3D vehicle.",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0"
+  }
+}

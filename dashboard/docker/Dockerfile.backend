@@ -1,0 +1,23 @@
+# Optional containerized backend. Base off L4T so the ZED SDK / CUDA / TensorRT
+# from the host JetPack are available; the ZED SDK + pyzed + onnxruntime-gpu are
+# expected to be installed in the base image (they are board-specific and not
+# pip-installable in a portable way). This Dockerfile layers only the dashboard
+# Python deps on top. Run with --runtime nvidia and the ZED + MAVLink devices
+# passed through (see docker-compose.yml).
+ARG L4T_BASE=nvcr.io/nvidia/l4t-jetpack:r36.4.0
+FROM ${L4T_BASE}
+
+WORKDIR /app
+COPY dashboard/backend/requirements.txt /app/requirements.txt
+RUN pip3 install --no-cache-dir -r /app/requirements.txt
+
+# App code (backend + reused rov + test_scripts). Mounted at runtime is also
+# fine; copying makes the image self-contained.
+COPY rov /app/rov
+COPY test_scripts /app/test_scripts
+COPY dashboard/backend /app/dashboard/backend
+
+ENV DASH_HOST=0.0.0.0
+WORKDIR /app/dashboard/backend
+EXPOSE 8000 8001
+CMD ["python3", "run_backend.py"]

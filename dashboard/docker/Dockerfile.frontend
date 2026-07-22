@@ -1,0 +1,13 @@
+# Frontend: build the static bundle, then serve it with Vite preview on :3000.
+FROM node:20-alpine
+
+WORKDIR /app
+COPY dashboard/frontend/package.json dashboard/frontend/package-lock.json* /app/
+RUN npm install
+
+COPY dashboard/frontend /app
+RUN npm run build
+
+ENV DASH_FRONTEND_PORT=3000
+EXPOSE 3000
+CMD ["npm", "run", "preview"]

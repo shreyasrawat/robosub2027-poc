@@ -1,0 +1,88 @@
+:root {
+  --bg: #0d1117;
+  --panel: #161b22;
+  --border: #30363d;
+  --text: #e6edf3;
+  --muted: #8b949e;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --danger: #f85149;
+  --accent: #1f6feb;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+
+.app { padding: 12px; max-width: 1600px; margin: 0 auto; }
+
+.app-header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 10px;
+}
+.app-header h1 { font-size: 18px; margin: 0; }
+
+.grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+.side { display: flex; flex-direction: column; gap: 12px; }
+
+@media (max-width: 1000px) {
+  .grid { grid-template-columns: 1fr; }
+}
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.panel-title {
+  font-weight: 600; font-size: 13px; text-transform: uppercase;
+  letter-spacing: 0.05em; color: var(--muted);
+  margin-bottom: 8px; display: flex; align-items: center; gap: 8px;
+}
+
+.badge, .chip {
+  font-size: 11px; padding: 2px 8px; border-radius: 12px;
+  background: #21262d; color: var(--text);
+}
+.badge.ok, .chip.ok { background: rgba(63,185,80,0.2); color: var(--ok); }
+.badge.warn, .chip.warn { background: rgba(210,153,34,0.2); color: var(--warn); }
+.chip.danger { background: rgba(248,81,73,0.2); color: var(--danger); }
+
+/* camera */
+.camera-frame {
+  position: relative; background: #000; border-radius: 6px; overflow: hidden;
+  aspect-ratio: 16 / 9; display: flex; align-items: center; justify-content: center;
+}
+.camera-frame img { width: 100%; height: 100%; object-fit: contain; display: block; }
+.camera-overlay-msg { position: absolute; color: var(--muted); font-size: 14px; }
+.camera-stats {
+  display: flex; gap: 16px; flex-wrap: wrap; font-size: 12px;
+  color: var(--muted); margin-top: 8px;
+}
+.camera-stats b { color: var(--text); }
+.camera-controls { display: flex; gap: 20px; margin-top: 8px; font-size: 12px; }
+.camera-controls label { display: flex; flex-direction: column; gap: 4px; color: var(--muted); }
+.det-list { list-style: none; padding: 0; margin: 8px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.det-list li { background: #21262d; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+
+/* telemetry */
+.tele-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 16px; }
+.tele-row { display: flex; justify-content: space-between; font-size: 13px; padding: 2px 0; }
+.tele-row span { color: var(--muted); }
+.tele-sub { font-size: 11px; color: var(--muted); text-transform: uppercase; margin: 10px 0 6px; }
+.thrusters { display: flex; gap: 6px; align-items: flex-end; height: 70px; }
+.thruster { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+.thruster .bar { width: 14px; background: var(--accent); border-radius: 2px 2px 0 0; min-height: 2px; }
+.thruster span { font-size: 9px; color: var(--muted); margin-top: 2px; }
+
+/* mission */
+.status-strip { display: flex; gap: 8px; flex-wrap: wrap; }
+
+/* 3d */
+.viz-canvas { width: 100%; height: 260px; border-radius: 6px; overflow: hidden; }

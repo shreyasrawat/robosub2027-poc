@@ -1,0 +1,37 @@
+# Optional Docker Compose deployment. Build context is the repo root so the
+# backend image can copy `rov/` and `test_scripts/`.
+#
+#   cd dashboard/docker && docker compose up --build
+#
+# The backend needs the NVIDIA runtime plus the ZED camera (USB) and the
+# Pixhawk (serial) passed through. On a Jetson without these, set
+# DASH_ENABLE_VISION=0 / DASH_ENABLE_TELEMETRY=0 to run degraded.
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: dashboard/docker/Dockerfile.backend
+    runtime: nvidia
+    network_mode: host          # so :8000/:8001 bind the Jetson's Ethernet IP
+    environment:
+      - DASH_HOST=0.0.0.0
+      - DASH_REST_PORT=8000
+      - DASH_WS_PORT=8001
+      - DASH_CORS_ORIGINS=http://192.168.2.2:3000,http://192.168.2.1:3000
+      - MAV_DEVICE=${MAV_DEVICE:-/dev/ttyACM0}
+    devices:
+      - /dev/ttyACM0:/dev/ttyACM0   # Pixhawk (adjust to your link)
+    volumes:
+      - /dev/bus/usb:/dev/bus/usb   # ZED camera (USB passthrough)
+      - /usr/local/zed:/usr/local/zed:ro
+    privileged: true
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../..
+      dockerfile: dashboard/docker/Dockerfile.frontend
+    network_mode: host
+    environment:
+      - DASH_FRONTEND_PORT=3000
+    restart: unless-stopped

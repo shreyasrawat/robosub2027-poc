@@ -7,6 +7,7 @@ ROS2 (colcon) workspace for the RoboSub 2027 autonomous underwater vehicle.
 | Path | What |
 |------|------|
 | `rov/` | First-party. Autonomous control framework: MAVLink link, ZED localization, closed-loop motion, missions. See `rov/README.md`. |
+| `dashboard/` | First-party. Web operator dashboard hosted on the Jetson: live ZED feed + detection overlays, telemetry, 3D attitude, mission status. FastAPI + WebSockets backend, React/Vite/Three.js frontend. See `dashboard/README.md`. |
 | `src/zed-ros2-wrapper/` | Vendored Stereolabs ZED ROS2 wrapper (C++). Third-party; own git repo. |
 | `test_scripts/` | First-party code. Standalone Python (no ROS runtime). |
 | `test_scripts/runtime_info.py` | Inference-backend selection + startup GPU diagnostics. |
@@ -14,7 +15,7 @@ ROS2 (colcon) workspace for the RoboSub 2027 autonomous underwater vehicle.
 | `plans/` | Plan / design documents for future work. |
 | `build/` `install/` `log/` | colcon artifacts. Do not edit. |
 
-Only `rov/`, `test_scripts/`, `plans/` and this file are first-party. Everything under `src/` is vendored.
+Only `rov/`, `dashboard/`, `test_scripts/`, `plans/` and this file are first-party. Everything under `src/` is vendored.
 
 ## `rov/` — control framework
 
@@ -58,6 +59,79 @@ handle per device per process.
 
 Adds `pymavlink` to the dependency set below. Gains are untuned starting
 values and the mount offsets are placeholder zeros.
+
+## `dashboard/` — web operator dashboard
+
+Monitoring-only web UI hosted on the Jetson, viewed from the Mac over the direct
+Ethernet link (Jetson `192.168.2.2`, Mac `192.168.2.1`). Plug in the cable, open
+`http://192.168.2.2:3000`.
+
+```
+dashboard/backend/    FastAPI REST (:8000) + websockets server (:8001)
+  vision_source.py    owns the ZED; reuses object_detection's CaptureStage/
+                      InferenceStage/detect + CLASS_NAMES; encodes JPEG/WebP
+  telemetry_source.py wraps rov Vehicle+Telemetry (read-only) + host stats
+  hoststats.py        CPU/RAM (psutil) + GPU/temp (jtop, else Tegra sysfs)
+  settings.py         DASH_* env config; runtime-mutable quality/fps
+dashboard/frontend/   React + Vite + Three.js (CameraView, TelemetryPanel,
+                      Vehicle3D, MissionStatus); URLs from window.location
+dashboard/scripts/    start-backend|frontend|all.sh (restart-on-crash)
+dashboard/docker/     optional Dockerfile.{backend,frontend} + compose
+```
+
+- **ZED single-handle exclusivity:** the dashboard owns the one ZED grabber, so
+  do **not** run `object_detection.py` or the full `rov` motion stack (which
+  opens the ZED via `zed_pose`) concurrently. MAVLink is a separate resource, so
+  the read-only telemetry link coexists fine in the same process.
+- **Attitude comes from the ZED, velocity from MAVLink.** `vision_source` enables
+  positional tracking on the one ZED handle and reads the fused pose every grab;
+  `TelemetrySource.set_attitude_provider()` then overrides `roll/pitch/yaw` in the
+  snapshot and adds `quat`, `zed_x/y/z`, `zed_tracking_ok`, `attitude_source`.
+  Reason: this vehicle's MAVLink `ATTITUDE` arrives as `None`. The ZED orientation
+  is used as soon as a quaternion exists — **not** gated on
+  `POSITIONAL_TRACKING_STATE.OK`, since the SDK reports `SEARCHING` while
+  re-aligning gravity but the orientation is already good. Velocity still comes
+  from MAVLink `GLOBAL_POSITION_INT`.
+- `rov/api/telemetry.py` gained `thrusters` (`SERVO_OUTPUT_RAW`), `velocity`, and
+  `leak` (`STATUSTEXT`) fields + `snapshot()` keys; additive, existing accessors
+  unchanged.
+- Camera frames stream as one binary WS message (`[4B len][JSON header][image]`)
+  so overlays/latency metadata travel with the pixels. Missing telemetry sensors
+  serialize as `null` → the UI shows N/A.
+- **3D orientation is a quaternion, not euler.** The frontend rotates the ZED
+  quaternion into the Three.js frame with a fixed change-of-basis — vehicle
+  (X fwd, Y left, Z up) → Three (X right, Y up, Z back), `q3 = qB·q·qB⁻¹` — and
+  the model is built nose-along `-Z`. Euler angles required guessing a rotation
+  order plus three signs and rendered the axes wrong; do not "simplify" it back.
+- LAN-only by design: CORS restricted to the Ethernet origins; no auth/HTTPS.
+  Adds `fastapi`, `uvicorn`, `websockets`, `psutil` (+ optional `jetson-stats`)
+  to the Python deps, and Node/npm for the frontend build.
+
+### Gotchas that cost real debugging time
+
+- **Nothing called from the telemetry loop may block.** `jtop.ok()` waits for the
+  jtop service's next sample (~1 s measured). Calling it in the 15 Hz loop froze
+  every snapshot, which presents to an operator as *severe lag*, not as failure.
+  `HostStats` therefore polls on its own thread and `snapshot()` only reads a
+  cache. The loop also wraps each snapshot in `try/except` — a dead producer
+  thread silently replays its last value forever.
+- **Tegra sysfs reads need a broad `except`.** Some `thermal_zone*/temp` nodes
+  return `None` mid-read and raise `TypeError`, which `except (OSError, ValueError)`
+  does not catch. That killed the telemetry thread outright.
+- **Vite must bind IPv4.** `vite --host` binds `::` (IPv6 only), so IPv4 clients
+  time out on `:3000` while the IPv4-bound backend on `:8000` works. The `--host`
+  flag is deliberately absent from the npm scripts so `vite.config.js`'s
+  `host: '0.0.0.0'` wins. Check with `ss -tlnp | grep :3000` → must be `0.0.0.0`,
+  never `*`.
+- **Host firewall must allow 3000/8000/8001** on the Ethernet subnet or the Mac
+  times out (dropped, not refused):
+  `sudo ufw allow from 192.168.2.0/24 to any port 3000 proto tcp` (repeat for
+  8000/8001). Keep the subnet scoping — a bare `allow 3000` opens every interface.
+- WS `write_limit=32768` bounds per-client buffering, so a slow client gets fewer
+  but always-current samples instead of a growing queue of stale ones.
+
+Full detail in `dashboard/README.md`; design + deviations in
+`plans/dashboard-planning.md`.
 
 ## `test_scripts/object_detection.py`
 
@@ -315,6 +389,10 @@ Rebuilding the engine for a different board:
 ```
 
 ## Out of scope / TODO
+- Dashboard: the 3D model's rendered orientation has **not** been visually confirmed against
+  the physical vehicle. The axis mapping is correct by construction (quaternion +
+  change-of-basis), but needs a human eye on the real sub.
+- Dashboard is monitoring-only — no arm/move commands from the browser.
 - Capture-stage cost (~36 ms) is the current FPS ceiling — see *Measured live performance*.
 - The prebuilt engine's precision has not been diffed against fp32 ONNX output for accuracy.
 - `ffc_rs_26.engine` is gitignored and board-specific — a new Jetson needs its own build.
